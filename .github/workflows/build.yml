@@ -1,0 +1,533 @@
+# Tareas Diarias: app Android (Java, sin dependencias externas).
+# Uso: guardar este archivo como .github/workflows/build.yml en un repo de GitHub.
+# El proyecto Android completo se genera en el paso "Generar proyecto" y el APK se publica en Releases.
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Generar proyecto
+        run: |
+          set -e
+          mkdir -p app/src/main/java/app/tareasdiarias app/src/main/res/drawable
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = 'TareasDiarias'
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'app.tareasdiarias'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'app.tareasdiarias'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+
+              <application
+                  android:label="Tareas Diarias"
+                  android:icon="@drawable/ic_launcher"
+                  android:allowBackup="true"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+
+                  <receiver android:name=".ReminderReceiver" android:exported="false"/>
+
+                  <receiver android:name=".BootReceiver" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED"/>
+                          <action android:name="android.intent.action.MY_PACKAGE_REPLACED"/>
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/drawable/ic_launcher.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#111111"
+                  android:pathData="M0,0h108v108h-108z"/>
+              <path
+                  android:fillColor="#00000000"
+                  android:strokeColor="#FFFFFF"
+                  android:strokeWidth="8"
+                  android:strokeLineCap="round"
+                  android:strokeLineJoin="round"
+                  android:pathData="M30,56 L48,74 L80,36"/>
+          </vector>
+          EOF
+
+          cat > app/src/main/res/drawable/ic_stat.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#00000000"
+                  android:strokeColor="#FFFFFFFF"
+                  android:strokeWidth="2.5"
+                  android:strokeLineCap="round"
+                  android:strokeLineJoin="round"
+                  android:pathData="M5,12.5 L10,17.5 L19,7"/>
+          </vector>
+          EOF
+
+          cat > app/src/main/java/app/tareasdiarias/Store.java <<'EOF'
+          package app.tareasdiarias;
+
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+          import java.text.SimpleDateFormat;
+          import java.util.ArrayList;
+          import java.util.Date;
+          import java.util.List;
+          import java.util.Locale;
+
+          final class Store {
+              static final class Task {
+                  String name;
+                  boolean done;
+                  Task(String name, boolean done) {
+                      this.name = name;
+                      this.done = done;
+                  }
+              }
+
+              private static final String DEFAULTS =
+                  "[{\"n\":\"Beber agua\",\"d\":false},"
+                  + "{\"n\":\"Moverme / estirar\",\"d\":false},"
+                  + "{\"n\":\"Revisar pendientes del dia\",\"d\":false}]";
+
+              private static SharedPreferences sp(Context c) {
+                  return c.getSharedPreferences("tareas", Context.MODE_PRIVATE);
+              }
+
+              static String today() {
+                  return new SimpleDateFormat("yyyy-MM-dd", Locale.US).format(new Date());
+              }
+
+              // Carga las tareas; si ha cambiado el dia, desmarca todas.
+              static List<Task> load(Context c) {
+                  SharedPreferences p = sp(c);
+                  boolean reset = !today().equals(p.getString("day", ""));
+                  List<Task> out = new ArrayList<>();
+                  try {
+                      JSONArray a = new JSONArray(p.getString("tasks", DEFAULTS));
+                      for (int i = 0; i < a.length(); i++) {
+                          JSONObject o = a.getJSONObject(i);
+                          out.add(new Task(o.getString("n"), !reset && o.optBoolean("d", false)));
+                      }
+                  } catch (Exception e) {
+                      // si los datos estan corruptos se devuelve lista vacia
+                  }
+                  if (reset) save(c, out);
+                  return out;
+              }
+
+              static void save(Context c, List<Task> list) {
+                  JSONArray a = new JSONArray();
+                  try {
+                      for (Task t : list) {
+                          JSONObject o = new JSONObject();
+                          o.put("n", t.name);
+                          o.put("d", t.done);
+                          a.put(o);
+                      }
+                  } catch (Exception e) {
+                      return;
+                  }
+                  sp(c).edit().putString("tasks", a.toString()).putString("day", today()).apply();
+              }
+
+              static int pending(Context c) {
+                  int n = 0;
+                  for (Task t : load(c)) if (!t.done) n++;
+                  return n;
+              }
+
+              static int hour(Context c) { return sp(c).getInt("h", 9); }
+              static int minute(Context c) { return sp(c).getInt("m", 0); }
+              static boolean enabled(Context c) { return sp(c).getBoolean("on", true); }
+
+              static void setTime(Context c, int h, int m) {
+                  sp(c).edit().putInt("h", h).putInt("m", m).apply();
+              }
+
+              static void setEnabled(Context c, boolean on) {
+                  sp(c).edit().putBoolean("on", on).apply();
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/app/tareasdiarias/ReminderReceiver.java <<'EOF'
+          package app.tareasdiarias;
+
+          import android.app.AlarmManager;
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import java.util.Calendar;
+
+          public class ReminderReceiver extends BroadcastReceiver {
+              static final String CHANNEL = "recordatorio";
+
+              private static PendingIntent alarmIntent(Context c) {
+                  Intent i = new Intent(c, ReminderReceiver.class);
+                  return PendingIntent.getBroadcast(c, 1, i,
+                      PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+              }
+
+              // Programa la proxima alarma (hoy a la hora elegida, o manana si ya paso).
+              static void schedule(Context c) {
+                  AlarmManager am = (AlarmManager) c.getSystemService(Context.ALARM_SERVICE);
+                  am.cancel(alarmIntent(c));
+                  if (!Store.enabled(c)) return;
+                  Calendar cal = Calendar.getInstance();
+                  cal.set(Calendar.HOUR_OF_DAY, Store.hour(c));
+                  cal.set(Calendar.MINUTE, Store.minute(c));
+                  cal.set(Calendar.SECOND, 0);
+                  cal.set(Calendar.MILLISECOND, 0);
+                  if (cal.getTimeInMillis() <= System.currentTimeMillis() + 1000) {
+                      cal.add(Calendar.DAY_OF_YEAR, 1);
+                  }
+                  am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, cal.getTimeInMillis(), alarmIntent(c));
+              }
+
+              static void ensureChannel(Context c) {
+                  NotificationManager nm = c.getSystemService(NotificationManager.class);
+                  NotificationChannel ch = new NotificationChannel(
+                      CHANNEL, "Recordatorio diario", NotificationManager.IMPORTANCE_HIGH);
+                  nm.createNotificationChannel(ch);
+              }
+
+              static void notifyPending(Context c, int pend) {
+                  ensureChannel(c);
+                  Intent open = new Intent(c, MainActivity.class)
+                      .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                  PendingIntent content = PendingIntent.getActivity(c, 0, open,
+                      PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                  String text = pend == 1
+                      ? "Te queda 1 tarea por hacer"
+                      : "Te quedan " + pend + " tareas por hacer";
+                  Notification n = new Notification.Builder(c, CHANNEL)
+                      .setSmallIcon(R.drawable.ic_stat)
+                      .setContentTitle("Tareas de hoy")
+                      .setContentText(text)
+                      .setContentIntent(content)
+                      .setAutoCancel(true)
+                      .build();
+                  c.getSystemService(NotificationManager.class).notify(1, n);
+              }
+
+              @Override
+              public void onReceive(Context c, Intent intent) {
+                  schedule(c); // deja programado el dia siguiente
+                  int pend = Store.pending(c);
+                  if (pend > 0) notifyPending(c, pend);
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/app/tareasdiarias/BootReceiver.java <<'EOF'
+          package app.tareasdiarias;
+
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+
+          public class BootReceiver extends BroadcastReceiver {
+              @Override
+              public void onReceive(Context c, Intent intent) {
+                  ReminderReceiver.schedule(c);
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/app/tareasdiarias/MainActivity.java <<'EOF'
+          package app.tareasdiarias;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.app.TimePickerDialog;
+          import android.content.pm.PackageManager;
+          import android.graphics.Paint;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.view.Gravity;
+          import android.view.inputmethod.EditorInfo;
+          import android.widget.Button;
+          import android.widget.CheckBox;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.Switch;
+          import android.widget.TextView;
+          import java.util.List;
+          import java.util.Locale;
+
+          public class MainActivity extends Activity {
+              private LinearLayout list;
+              private TextView summary;
+              private Button timeBtn;
+              private EditText input;
+              private List<Store.Task> tasks;
+
+              private int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
+              }
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  ReminderReceiver.ensureChannel(this);
+                  if (Build.VERSION.SDK_INT >= 33
+                      && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                          != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1);
+                  }
+                  buildUi();
+                  ReminderReceiver.schedule(this);
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  refresh();
+              }
+
+              private void buildUi() {
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(dp(16), dp(24), dp(16), dp(16));
+
+                  TextView title = new TextView(this);
+                  title.setText("Tareas de hoy");
+                  title.setTextSize(28);
+                  root.addView(title);
+
+                  summary = new TextView(this);
+                  summary.setTextSize(15);
+                  root.addView(summary);
+
+                  LinearLayout row = new LinearLayout(this);
+                  row.setOrientation(LinearLayout.HORIZONTAL);
+                  row.setGravity(Gravity.CENTER_VERTICAL);
+                  Switch sw = new Switch(this);
+                  sw.setText("Recordatorio diario");
+                  sw.setChecked(Store.enabled(this));
+                  sw.setOnCheckedChangeListener((v, on) -> {
+                      Store.setEnabled(this, on);
+                      ReminderReceiver.schedule(this);
+                  });
+                  row.addView(sw, new LinearLayout.LayoutParams(
+                      0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+                  timeBtn = new Button(this);
+                  timeBtn.setOnClickListener(v -> pickTime());
+                  row.addView(timeBtn);
+                  root.addView(row);
+
+                  Button test = new Button(this);
+                  test.setText("Probar aviso ahora");
+                  test.setOnClickListener(v ->
+                      ReminderReceiver.notifyPending(this, Math.max(1, Store.pending(this))));
+                  root.addView(test);
+
+                  ScrollView sv = new ScrollView(this);
+                  list = new LinearLayout(this);
+                  list.setOrientation(LinearLayout.VERTICAL);
+                  sv.addView(list);
+                  root.addView(sv, new LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+
+                  LinearLayout add = new LinearLayout(this);
+                  add.setOrientation(LinearLayout.HORIZONTAL);
+                  input = new EditText(this);
+                  input.setHint("Nueva tarea");
+                  input.setSingleLine(true);
+                  input.setImeOptions(EditorInfo.IME_ACTION_DONE);
+                  add.addView(input, new LinearLayout.LayoutParams(
+                      0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+                  Button btn = new Button(this);
+                  btn.setText("A\u00f1adir");
+                  btn.setOnClickListener(v -> addTask());
+                  add.addView(btn);
+                  root.addView(add);
+
+                  setContentView(root);
+              }
+
+              private void strike(TextView t, boolean on) {
+                  int f = t.getPaintFlags();
+                  t.setPaintFlags(on ? (f | Paint.STRIKE_THRU_TEXT_FLAG)
+                                     : (f & ~Paint.STRIKE_THRU_TEXT_FLAG));
+              }
+
+              private void refresh() {
+                  tasks = Store.load(this);
+                  list.removeAllViews();
+                  for (int i = 0; i < tasks.size(); i++) {
+                      final int idx = i;
+                      Store.Task t = tasks.get(i);
+                      CheckBox cb = new CheckBox(this);
+                      cb.setText(t.name);
+                      cb.setTextSize(18);
+                      cb.setPadding(dp(8), dp(12), dp(8), dp(12));
+                      cb.setChecked(t.done);
+                      strike(cb, t.done);
+                      cb.setOnCheckedChangeListener((v, on) -> {
+                          tasks.get(idx).done = on;
+                          Store.save(this, tasks);
+                          strike(cb, on);
+                          updateSummary();
+                      });
+                      cb.setOnLongClickListener(v -> {
+                          confirmDelete(idx);
+                          return true;
+                      });
+                      list.addView(cb);
+                  }
+                  updateSummary();
+                  timeBtn.setText(String.format(Locale.getDefault(), "%02d:%02d",
+                      Store.hour(this), Store.minute(this)));
+              }
+
+              private void updateSummary() {
+                  int d = 0;
+                  for (Store.Task t : tasks) if (t.done) d++;
+                  summary.setText(d + " de " + tasks.size()
+                      + " completadas \u00b7 se reinician cada d\u00eda");
+              }
+
+              private void addTask() {
+                  String s = input.getText().toString().trim();
+                  if (s.isEmpty()) return;
+                  tasks.add(new Store.Task(s, false));
+                  Store.save(this, tasks);
+                  input.setText("");
+                  refresh();
+              }
+
+              private void confirmDelete(final int idx) {
+                  new AlertDialog.Builder(this)
+                      .setMessage("\u00bfBorrar \"" + tasks.get(idx).name + "\"?")
+                      .setPositiveButton("Borrar", (d, w) -> {
+                          tasks.remove(idx);
+                          Store.save(this, tasks);
+                          refresh();
+                      })
+                      .setNegativeButton("Cancelar", null)
+                      .show();
+              }
+
+              private void pickTime() {
+                  new TimePickerDialog(this, (view, h, m) -> {
+                      Store.setTime(this, h, m);
+                      ReminderReceiver.schedule(this);
+                      refresh();
+                  }, Store.hour(this), Store.minute(this), true).show();
+              }
+          }
+          EOF
+
+      - name: Compilar APK debug
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tareas-diarias-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Tareas Diarias build ${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
