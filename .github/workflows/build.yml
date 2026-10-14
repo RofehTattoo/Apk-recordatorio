@@ -1,6 +1,7 @@
-# Tareas Diarias: app Android (Java, sin dependencias externas).
+# Tareas Diarias v2: app Android (Java, sin dependencias externas).
 # Uso: guardar este archivo como .github/workflows/build.yml en un repo de GitHub.
 # El proyecto Android completo se genera en el paso "Generar proyecto" y el APK se publica en Releases.
+# Novedades v2: 3 avisos programables al dia + historial de 7 dias.
 name: Build APK
 
 on:
@@ -73,8 +74,8 @@ jobs:
                   applicationId 'app.tareasdiarias'
                   minSdk 26
                   targetSdk 34
-                  versionCode 1
-                  versionName '1.0'
+                  versionCode 2
+                  versionName '2.0'
               }
 
               compileOptions {
@@ -163,11 +164,17 @@ jobs:
           import org.json.JSONObject;
           import java.text.SimpleDateFormat;
           import java.util.ArrayList;
+          import java.util.Collections;
           import java.util.Date;
+          import java.util.Iterator;
           import java.util.List;
           import java.util.Locale;
 
           final class Store {
+              static final int SLOTS = 3;           // avisos al dia
+              static final int HISTORY_DAYS = 7;    // dias que se conservan
+              private static final int[] DEFAULT_HOURS = {9, 14, 20};
+
               static final class Task {
                   String name;
                   boolean done;
@@ -190,55 +197,119 @@ jobs:
                   return new SimpleDateFormat("yyyy-MM-dd", Locale.US).format(new Date());
               }
 
-              // Carga las tareas; si ha cambiado el dia, desmarca todas.
-              static List<Task> load(Context c) {
-                  SharedPreferences p = sp(c);
-                  boolean reset = !today().equals(p.getString("day", ""));
-                  List<Task> out = new ArrayList<>();
+              private static JSONArray arr(String s) {
                   try {
-                      JSONArray a = new JSONArray(p.getString("tasks", DEFAULTS));
-                      for (int i = 0; i < a.length(); i++) {
-                          JSONObject o = a.getJSONObject(i);
-                          out.add(new Task(o.getString("n"), !reset && o.optBoolean("d", false)));
-                      }
+                      return new JSONArray(s);
                   } catch (Exception e) {
-                      // si los datos estan corruptos se devuelve lista vacia
+                      return new JSONArray();
                   }
-                  if (reset) save(c, out);
-                  return out;
               }
 
-              static void save(Context c, List<Task> list) {
+              private static JSONArray toJson(List<Task> list) {
                   JSONArray a = new JSONArray();
-                  try {
-                      for (Task t : list) {
+                  for (Task t : list) {
+                      try {
                           JSONObject o = new JSONObject();
                           o.put("n", t.name);
                           o.put("d", t.done);
                           a.put(o);
+                      } catch (Exception e) {
+                          // se omite la tarea que no se pueda serializar
                       }
-                  } catch (Exception e) {
-                      return;
                   }
-                  sp(c).edit().putString("tasks", a.toString()).putString("day", today()).apply();
+                  return a;
               }
 
-              static int pending(Context c) {
-                  int n = 0;
-                  for (Task t : load(c)) if (!t.done) n++;
-                  return n;
+              private static List<Task> parse(JSONArray a) {
+                  List<Task> out = new ArrayList<>();
+                  if (a == null) return out;
+                  for (int i = 0; i < a.length(); i++) {
+                      JSONObject o = a.optJSONObject(i);
+                      if (o == null) continue;
+                      out.add(new Task(o.optString("n", ""), o.optBoolean("d", false)));
+                  }
+                  return out;
               }
 
-              static int hour(Context c) { return sp(c).getInt("h", 9); }
-              static int minute(Context c) { return sp(c).getInt("m", 0); }
-              static boolean enabled(Context c) { return sp(c).getBoolean("on", true); }
-
-              static void setTime(Context c, int h, int m) {
-                  sp(c).edit().putInt("h", h).putInt("m", m).apply();
+              // Carga las tareas. Si ha cambiado el dia: guarda el dia anterior en el
+              // historial y desmarca todas.
+              static List<Task> load(Context c) {
+                  SharedPreferences p = sp(c);
+                  String prev = p.getString("day", "");
+                  List<Task> out = parse(arr(p.getString("tasks", DEFAULTS)));
+                  if (!today().equals(prev)) {
+                      if (!prev.isEmpty()) pushHistory(c, prev, out);
+                      for (Task t : out) t.done = false;
+                      save(c, out);
+                  }
+                  return out;
               }
 
-              static void setEnabled(Context c, boolean on) {
-                  sp(c).edit().putBoolean("on", on).apply();
+              static void save(Context c, List<Task> list) {
+                  sp(c).edit()
+                      .putString("tasks", toJson(list).toString())
+                      .putString("day", today())
+                      .apply();
+              }
+
+              static List<String> pendingNames(Context c) {
+                  List<String> out = new ArrayList<>();
+                  for (Task t : load(c)) if (!t.done) out.add(t.name);
+                  return out;
+              }
+
+              // ---- Historial ----
+
+              private static JSONObject history(Context c) {
+                  try {
+                      return new JSONObject(sp(c).getString("hist", "{}"));
+                  } catch (Exception e) {
+                      return new JSONObject();
+                  }
+              }
+
+              private static void pushHistory(Context c, String date, List<Task> list) {
+                  if (list.isEmpty()) return;
+                  try {
+                      JSONObject h = history(c);
+                      h.put(date, toJson(list));
+                      List<String> keys = new ArrayList<>();
+                      Iterator<String> it = h.keys();
+                      while (it.hasNext()) keys.add(it.next());
+                      Collections.sort(keys); // yyyy-MM-dd se ordena cronologicamente
+                      while (keys.size() > HISTORY_DAYS) h.remove(keys.remove(0));
+                      sp(c).edit().putString("hist", h.toString()).apply();
+                  } catch (Exception e) {
+                      // si falla, simplemente no se guarda ese dia
+                  }
+              }
+
+              // Estado final de un dia pasado, o null si no hay datos.
+              static List<Task> historyDay(Context c, String date) {
+                  JSONArray a = history(c).optJSONArray(date);
+                  return a == null ? null : parse(a);
+              }
+
+              // ---- Avisos (SLOTS franjas, cada una con hora y activado/desactivado) ----
+
+              static int hour(Context c, int slot) {
+                  return sp(c).getInt("h" + slot, DEFAULT_HOURS[slot]);
+              }
+
+              static int minute(Context c, int slot) {
+                  return sp(c).getInt("m" + slot, 0);
+              }
+
+              static boolean enabled(Context c, int slot) {
+                  return sp(c).getBoolean("on" + slot, true);
+              }
+
+              static void setTime(Context c, int slot, int h, int m) {
+                  sp(c).edit().putInt("h" + slot, h).putInt("m" + slot, m).apply();
+              }
+
+              static void setEnabled(Context c, int slot, boolean on) {
+                  sp(c).edit().putBoolean("on" + slot, on).apply();
               }
           }
           EOF
@@ -254,31 +325,40 @@ jobs:
           import android.content.BroadcastReceiver;
           import android.content.Context;
           import android.content.Intent;
+          import android.text.TextUtils;
           import java.util.Calendar;
+          import java.util.List;
 
           public class ReminderReceiver extends BroadcastReceiver {
               static final String CHANNEL = "recordatorio";
+              private static final int NOTIF_ID = 1;
 
-              private static PendingIntent alarmIntent(Context c) {
-                  Intent i = new Intent(c, ReminderReceiver.class);
-                  return PendingIntent.getBroadcast(c, 1, i,
+              // Un PendingIntent distinto por franja (requestCode = 100 + franja).
+              private static PendingIntent alarmIntent(Context c, int slot) {
+                  Intent i = new Intent(c, ReminderReceiver.class).putExtra("slot", slot);
+                  return PendingIntent.getBroadcast(c, 100 + slot, i,
                       PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
               }
 
-              // Programa la proxima alarma (hoy a la hora elegida, o manana si ya paso).
-              static void schedule(Context c) {
+              // Programa la proxima alarma de una franja (hoy a su hora, o manana si ya paso).
+              static void schedule(Context c, int slot) {
                   AlarmManager am = (AlarmManager) c.getSystemService(Context.ALARM_SERVICE);
-                  am.cancel(alarmIntent(c));
-                  if (!Store.enabled(c)) return;
+                  am.cancel(alarmIntent(c, slot));
+                  if (!Store.enabled(c, slot)) return;
                   Calendar cal = Calendar.getInstance();
-                  cal.set(Calendar.HOUR_OF_DAY, Store.hour(c));
-                  cal.set(Calendar.MINUTE, Store.minute(c));
+                  cal.set(Calendar.HOUR_OF_DAY, Store.hour(c, slot));
+                  cal.set(Calendar.MINUTE, Store.minute(c, slot));
                   cal.set(Calendar.SECOND, 0);
                   cal.set(Calendar.MILLISECOND, 0);
                   if (cal.getTimeInMillis() <= System.currentTimeMillis() + 1000) {
                       cal.add(Calendar.DAY_OF_YEAR, 1);
                   }
-                  am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, cal.getTimeInMillis(), alarmIntent(c));
+                  am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, cal.getTimeInMillis(),
+                      alarmIntent(c, slot));
+              }
+
+              static void scheduleAll(Context c) {
+                  for (int s = 0; s < Store.SLOTS; s++) schedule(c, s);
               }
 
               static void ensureChannel(Context c) {
@@ -288,30 +368,45 @@ jobs:
                   nm.createNotificationChannel(ch);
               }
 
-              static void notifyPending(Context c, int pend) {
+              // Una sola notificacion: cada aviso sustituye a la anterior con la lista actual.
+              static void notifyText(Context c, String title, String body) {
                   ensureChannel(c);
                   Intent open = new Intent(c, MainActivity.class)
                       .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
                   PendingIntent content = PendingIntent.getActivity(c, 0, open,
                       PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-                  String text = pend == 1
-                      ? "Te queda 1 tarea por hacer"
-                      : "Te quedan " + pend + " tareas por hacer";
                   Notification n = new Notification.Builder(c, CHANNEL)
                       .setSmallIcon(R.drawable.ic_stat)
-                      .setContentTitle("Tareas de hoy")
-                      .setContentText(text)
+                      .setContentTitle(title)
+                      .setContentText(body)
+                      .setStyle(new Notification.BigTextStyle().bigText(body))
                       .setContentIntent(content)
                       .setAutoCancel(true)
                       .build();
-                  c.getSystemService(NotificationManager.class).notify(1, n);
+                  c.getSystemService(NotificationManager.class).notify(NOTIF_ID, n);
+              }
+
+              static void cancelNotification(Context c) {
+                  c.getSystemService(NotificationManager.class).cancel(NOTIF_ID);
               }
 
               @Override
               public void onReceive(Context c, Intent intent) {
-                  schedule(c); // deja programado el dia siguiente
-                  int pend = Store.pending(c);
-                  if (pend > 0) notifyPending(c, pend);
+                  int slot = intent.getIntExtra("slot", -1);
+                  if (slot < 0 || slot >= Store.SLOTS) {
+                      scheduleAll(c);
+                      return;
+                  }
+                  schedule(c, slot); // deja programado el dia siguiente de esta franja
+                  List<String> names = Store.pendingNames(c);
+                  if (names.isEmpty()) {
+                      cancelNotification(c);
+                      return;
+                  }
+                  String title = names.size() == 1
+                      ? "Te queda 1 tarea por hacer"
+                      : "Te quedan " + names.size() + " tareas por hacer";
+                  notifyText(c, title, TextUtils.join(", ", names));
               }
           }
           EOF
@@ -326,7 +421,7 @@ jobs:
           public class BootReceiver extends BroadcastReceiver {
               @Override
               public void onReceive(Context c, Intent intent) {
-                  ReminderReceiver.schedule(c);
+                  ReminderReceiver.scheduleAll(c);
               }
           }
           EOF
@@ -342,40 +437,54 @@ jobs:
           import android.graphics.Paint;
           import android.os.Build;
           import android.os.Bundle;
+          import android.text.TextUtils;
           import android.view.Gravity;
+          import android.view.View;
           import android.view.inputmethod.EditorInfo;
           import android.widget.Button;
           import android.widget.CheckBox;
           import android.widget.EditText;
           import android.widget.LinearLayout;
+          import android.widget.ProgressBar;
           import android.widget.ScrollView;
           import android.widget.Switch;
           import android.widget.TextView;
+          import android.widget.Toast;
+          import java.text.SimpleDateFormat;
+          import java.util.Calendar;
           import java.util.List;
           import java.util.Locale;
 
           public class MainActivity extends Activity {
+              private static final int WRAP = LinearLayout.LayoutParams.WRAP_CONTENT;
+              private static final int MATCH = LinearLayout.LayoutParams.MATCH_PARENT;
+
               private LinearLayout list;
               private TextView summary;
-              private Button timeBtn;
+              private final Button[] timeBtns = new Button[Store.SLOTS];
               private EditText input;
               private List<Store.Task> tasks;
+              private String shownDay = "";
 
               private int dp(int v) {
                   return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
+              }
+
+              private boolean notificationsAllowed() {
+                  return Build.VERSION.SDK_INT < 33
+                      || checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                          == PackageManager.PERMISSION_GRANTED;
               }
 
               @Override
               protected void onCreate(Bundle b) {
                   super.onCreate(b);
                   ReminderReceiver.ensureChannel(this);
-                  if (Build.VERSION.SDK_INT >= 33
-                      && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
-                          != PackageManager.PERMISSION_GRANTED) {
+                  if (!notificationsAllowed()) {
                       requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1);
                   }
                   buildUi();
-                  ReminderReceiver.schedule(this);
+                  ReminderReceiver.scheduleAll(this);
               }
 
               @Override
@@ -398,35 +507,43 @@ jobs:
                   summary.setTextSize(15);
                   root.addView(summary);
 
-                  LinearLayout row = new LinearLayout(this);
-                  row.setOrientation(LinearLayout.HORIZONTAL);
-                  row.setGravity(Gravity.CENTER_VERTICAL);
-                  Switch sw = new Switch(this);
-                  sw.setText("Recordatorio diario");
-                  sw.setChecked(Store.enabled(this));
-                  sw.setOnCheckedChangeListener((v, on) -> {
-                      Store.setEnabled(this, on);
-                      ReminderReceiver.schedule(this);
-                  });
-                  row.addView(sw, new LinearLayout.LayoutParams(
-                      0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-                  timeBtn = new Button(this);
-                  timeBtn.setOnClickListener(v -> pickTime());
-                  row.addView(timeBtn);
-                  root.addView(row);
+                  for (int s = 0; s < Store.SLOTS; s++) {
+                      final int slot = s;
+                      LinearLayout row = new LinearLayout(this);
+                      row.setOrientation(LinearLayout.HORIZONTAL);
+                      row.setGravity(Gravity.CENTER_VERTICAL);
+                      Switch sw = new Switch(this);
+                      sw.setText("Aviso " + (s + 1));
+                      sw.setChecked(Store.enabled(this, slot));
+                      sw.setOnCheckedChangeListener((v, on) -> {
+                          Store.setEnabled(this, slot, on);
+                          ReminderReceiver.schedule(this, slot);
+                      });
+                      row.addView(sw, new LinearLayout.LayoutParams(0, WRAP, 1f));
+                      Button tb = new Button(this);
+                      tb.setOnClickListener(v -> pickTime(slot));
+                      timeBtns[s] = tb;
+                      row.addView(tb);
+                      root.addView(row);
+                  }
 
+                  LinearLayout tools = new LinearLayout(this);
+                  tools.setOrientation(LinearLayout.HORIZONTAL);
                   Button test = new Button(this);
-                  test.setText("Probar aviso ahora");
-                  test.setOnClickListener(v ->
-                      ReminderReceiver.notifyPending(this, Math.max(1, Store.pending(this))));
-                  root.addView(test);
+                  test.setText("Probar aviso");
+                  test.setOnClickListener(v -> testNotification());
+                  Button hist = new Button(this);
+                  hist.setText("Historial");
+                  hist.setOnClickListener(v -> showHistory());
+                  tools.addView(test, new LinearLayout.LayoutParams(0, WRAP, 1f));
+                  tools.addView(hist, new LinearLayout.LayoutParams(0, WRAP, 1f));
+                  root.addView(tools);
 
                   ScrollView sv = new ScrollView(this);
                   list = new LinearLayout(this);
                   list.setOrientation(LinearLayout.VERTICAL);
                   sv.addView(list);
-                  root.addView(sv, new LinearLayout.LayoutParams(
-                      LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+                  root.addView(sv, new LinearLayout.LayoutParams(MATCH, 0, 1f));
 
                   LinearLayout add = new LinearLayout(this);
                   add.setOrientation(LinearLayout.HORIZONTAL);
@@ -434,8 +551,7 @@ jobs:
                   input.setHint("Nueva tarea");
                   input.setSingleLine(true);
                   input.setImeOptions(EditorInfo.IME_ACTION_DONE);
-                  add.addView(input, new LinearLayout.LayoutParams(
-                      0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+                  add.addView(input, new LinearLayout.LayoutParams(0, WRAP, 1f));
                   Button btn = new Button(this);
                   btn.setText("A\u00f1adir");
                   btn.setOnClickListener(v -> addTask());
@@ -451,8 +567,17 @@ jobs:
                                      : (f & ~Paint.STRIKE_THRU_TEXT_FLAG));
               }
 
+              // Si la app se quedo abierta pasada la medianoche, la pantalla muestra el
+              // dia anterior: se recarga y se descarta la accion para no mezclar dias.
+              private boolean staleDay() {
+                  if (Store.today().equals(shownDay)) return false;
+                  refresh();
+                  return true;
+              }
+
               private void refresh() {
                   tasks = Store.load(this);
+                  shownDay = Store.today();
                   list.removeAllViews();
                   for (int i = 0; i < tasks.size(); i++) {
                       final int idx = i;
@@ -464,6 +589,7 @@ jobs:
                       cb.setChecked(t.done);
                       strike(cb, t.done);
                       cb.setOnCheckedChangeListener((v, on) -> {
+                          if (staleDay()) return;
                           tasks.get(idx).done = on;
                           Store.save(this, tasks);
                           strike(cb, on);
@@ -475,9 +601,11 @@ jobs:
                       });
                       list.addView(cb);
                   }
+                  for (int s = 0; s < Store.SLOTS; s++) {
+                      timeBtns[s].setText(String.format(Locale.getDefault(), "%02d:%02d",
+                          Store.hour(this, s), Store.minute(this, s)));
+                  }
                   updateSummary();
-                  timeBtn.setText(String.format(Locale.getDefault(), "%02d:%02d",
-                      Store.hour(this), Store.minute(this)));
               }
 
               private void updateSummary() {
@@ -485,9 +613,14 @@ jobs:
                   for (Store.Task t : tasks) if (t.done) d++;
                   summary.setText(d + " de " + tasks.size()
                       + " completadas \u00b7 se reinician cada d\u00eda");
+                  // Si ya esta todo hecho, se retira el aviso que siga en pantalla.
+                  if (!tasks.isEmpty() && d == tasks.size()) {
+                      ReminderReceiver.cancelNotification(this);
+                  }
               }
 
               private void addTask() {
+                  if (staleDay()) return;
                   String s = input.getText().toString().trim();
                   if (s.isEmpty()) return;
                   tasks.add(new Store.Task(s, false));
@@ -500,6 +633,7 @@ jobs:
                   new AlertDialog.Builder(this)
                       .setMessage("\u00bfBorrar \"" + tasks.get(idx).name + "\"?")
                       .setPositiveButton("Borrar", (d, w) -> {
+                          if (staleDay()) return;
                           tasks.remove(idx);
                           Store.save(this, tasks);
                           refresh();
@@ -508,12 +642,81 @@ jobs:
                       .show();
               }
 
-              private void pickTime() {
+              private void pickTime(final int slot) {
                   new TimePickerDialog(this, (view, h, m) -> {
-                      Store.setTime(this, h, m);
-                      ReminderReceiver.schedule(this);
+                      Store.setTime(this, slot, h, m);
+                      ReminderReceiver.schedule(this, slot);
                       refresh();
-                  }, Store.hour(this), Store.minute(this), true).show();
+                  }, Store.hour(this, slot), Store.minute(this, slot), true).show();
+              }
+
+              private void testNotification() {
+                  if (!notificationsAllowed()) {
+                      Toast.makeText(this, "Activa las notificaciones de la app en Ajustes",
+                          Toast.LENGTH_LONG).show();
+                      return;
+                  }
+                  List<String> n = Store.pendingNames(this);
+                  ReminderReceiver.notifyText(this, "Aviso de prueba",
+                      n.isEmpty() ? "Todas las tareas completadas" : TextUtils.join(", ", n));
+              }
+
+              // Historial: los 7 dias anteriores a hoy, con progreso y detalle al tocar.
+              private void showHistory() {
+                  ScrollView sv = new ScrollView(this);
+                  LinearLayout box = new LinearLayout(this);
+                  box.setOrientation(LinearLayout.VERTICAL);
+                  box.setPadding(dp(20), dp(8), dp(20), dp(8));
+                  sv.addView(box);
+
+                  SimpleDateFormat key = new SimpleDateFormat("yyyy-MM-dd", Locale.US);
+                  SimpleDateFormat label = new SimpleDateFormat("EEE d/M", Locale.getDefault());
+                  Calendar cal = Calendar.getInstance();
+                  for (int i = 0; i < Store.HISTORY_DAYS; i++) {
+                      cal.add(Calendar.DAY_OF_YEAR, -1);
+                      final String lab = label.format(cal.getTime());
+                      final List<Store.Task> day = Store.historyDay(this, key.format(cal.getTime()));
+
+                      TextView tv = new TextView(this);
+                      tv.setTextSize(16);
+                      tv.setPadding(0, dp(10), 0, 0);
+                      box.addView(tv);
+
+                      if (day == null || day.isEmpty()) {
+                          tv.setText(lab + "  \u2013  sin datos");
+                          continue;
+                      }
+                      int done = 0;
+                      for (Store.Task t : day) if (t.done) done++;
+                      tv.setText(lab + "   " + done + "/" + day.size());
+
+                      ProgressBar pb = new ProgressBar(this, null,
+                          android.R.attr.progressBarStyleHorizontal);
+                      pb.setMax(day.size());
+                      pb.setProgress(done);
+                      box.addView(pb, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+                      View.OnClickListener l = v -> showDay(lab, day);
+                      tv.setOnClickListener(l);
+                      pb.setOnClickListener(l);
+                  }
+                  new AlertDialog.Builder(this)
+                      .setTitle("Historial (7 d\u00edas)")
+                      .setView(sv)
+                      .setPositiveButton("Cerrar", null)
+                      .show();
+              }
+
+              private void showDay(String lab, List<Store.Task> day) {
+                  StringBuilder sb = new StringBuilder();
+                  for (Store.Task t : day) {
+                      sb.append(t.done ? "\u2713 " : "\u2717 ").append(t.name).append('\n');
+                  }
+                  new AlertDialog.Builder(this)
+                      .setTitle(lab)
+                      .setMessage(sb.toString().trim())
+                      .setPositiveButton("Cerrar", null)
+                      .show();
               }
           }
           EOF
